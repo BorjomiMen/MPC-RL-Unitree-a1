@@ -817,3 +817,427 @@ class WalkSimulation(StandingSimulation):
                 )
 
         self.advance_clock()
+
+def run_case(
+    vx=0.001,
+    vy=0.0,
+    cycles=2,
+    headless=True,
+    push=0.0,
+    verbose=True,
+):
+    path = (
+        Path(__file__).parent
+        / "models/unitree_a1/scene_mpc.xml"
+    )
+
+    sim = WalkSimulation(path, vx, vy, cycles)
+    baseline = sim.x_ref[3:6].copy()
+
+    tilt = torque = drift = inactive = 0.0
+    minimum_clearance = np.inf
+    minimum_margin = np.inf
+    maximum_swing_load = 0.0
+    checked_steps = set()
+
+    context = (
+        nullcontext(None)
+        if headless
+        else mujoco.viewer.launch_passive(
+            sim.model, sim.data
+        )
+    )
+
+    if verbose:
+        print(
+            f"Planning complete: "
+            f"{sim.plan.duration:.1f}s, "
+            f"IK={sim.trajectory.ik_error:.2e}m"
+        )
+
+    with context as viewer:
+        while sim.t < sim.plan.duration - 1e-9:
+            if (
+                viewer is not None
+                and not viewer.is_running()
+            ):
+                raise RuntimeError(
+                    "Simulation closed before completion"
+                )
+
+            started = time.perf_counter()
+            sim.data.xfrc_applied[sim.trunk_id] = 0.0
+
+            if sim.plan.steps:
+                push_start = (
+                    sim.plan.steps[0].lift_end + 0.3
+                )
+
+                if push_start <= sim.t < push_start + 0.2:
+                    sim.data.xfrc_applied[
+                        sim.trunk_id, 0
+                    ] = push
+
+            sim.step()
+            state = sim.read_state()
+
+            torque = max(
+                torque,
+                float(np.max(
+                    np.abs(sim.unclipped_torque)
+                )),
+            )
+            tilt = max(
+                tilt,
+                float(np.max(np.abs(state[:2]))),
+            )
+
+            if sim.t < 3.0:
+                baseline = state[3:6].copy()
+
+            feet_goal, _, _, active, phase = (
+                sim.plan.sample(sim.applied_t)
+            )
+            feet = sim.data.geom_xpos[
+                sim.foot_geom_ids
+            ]
+            stance = np.ones(4, dtype=bool)
+
+            if (
+                active is not None
+                and active.lift_start
+                <= sim.applied_t
+                < active.reload_start
+            ):
+                stance[active.leg] = False
+
+                inactive = max(
+                    inactive,
+                    float(np.max(np.abs(
+                        sim.forces[active.leg]
+                    ))),
+                )
+
+                if (
+                    active.lift_end + 0.15
+                    <= sim.applied_t
+                    < active.advance_end
+                ):
+                    loads = foot_ground_loads(sim)
+                    support = [
+                        i for i in range(4)
+                        if i != active.leg
+                    ]
+
+                    clearance = (
+                        feet[active.leg, 2]
+                        - sim.model.geom_size[
+                            sim.foot_geom_ids[active.leg],
+                            0,
+                        ]
+                    )
+                    margin = triangle_margin(
+                        state[3:5],
+                        feet[support, :2],
+                    )
+
+                    minimum_clearance = min(
+                        minimum_clearance, clearance
+                    )
+                    minimum_margin = min(
+                        minimum_margin, margin
+                    )
+                    maximum_swing_load = max(
+                        maximum_swing_load,
+                        abs(float(loads[active.leg])),
+                    )
+                    checked_steps.add(active.start)
+
+            drift = max(
+                drift,
+                float(np.max(np.linalg.norm(
+                    feet[stance, :2]
+                    - feet_goal[stance, :2],
+                    axis=1,
+                ))),
+            )
+
+            if viewer is not None:
+                viewer.sync()
+
+                remaining = (
+                    sim.model.opt.timestep
+                    - (time.perf_counter() - started)
+                )
+
+                if remaining > 0.0:
+                    time.sleep(remaining)
+
+    state = sim.read_state()
+    loads = foot_ground_loads(sim)
+    feet = sim.data.geom_xpos[sim.foot_geom_ids]
+
+    com_error = np.linalg.norm(
+        state[3:5] - sim.plan.final_com[:2]
+    )
+    foot_error = np.max(np.linalg.norm(
+        feet[:, :2] - sim.plan.final_feet[:, :2],
+        axis=1,
+    ))
+
+    expected = (
+        sim.plan.final_com[:2] - sim.plan.com0[:2]
+    )
+    displacement_error = np.linalg.norm(
+        state[3:5] - baseline[:2] - expected
+    )
+
+    passed = (
+        len(checked_steps) == len(sim.plan.steps)
+        and com_error < 0.012
+        and displacement_error < 0.015
+        and foot_error < 0.012
+        and drift < 0.015
+        and inactive < 1e-3
+        and np.degrees(tilt) < 3.0
+        and minimum_clearance > 0.025
+        and minimum_margin > 0.025
+        and maximum_swing_load < 0.1
+        and np.min(loads) > 5.0
+        and np.linalg.norm(state[9:11]) < 0.01
+    )
+
+    result = dict(
+        passed=bool(passed),
+        physical_s=round(sim.data.time, 3),
+        steps=len(checked_steps),
+        com_error_mm=float(com_error * 1000),
+        foot_error_mm=float(foot_error * 1000),
+        stance_error_mm=drift * 1000,
+        tilt_deg=float(np.degrees(tilt)),
+        max_torque_nm=torque,
+        inactive_force_n=inactive,
+        qp_p99_ms=float(np.percentile(
+            sim.solve_times, 99
+        )),
+        qp_max_ms=max(sim.solve_times),
+        updates=sim.mpc_updates,
+    )
+
+    if verbose:
+        print(result)
+        print(
+            "MPC BASELINE PASSED"
+            if passed
+            else "MPC BASELINE FAILED"
+        )
+
+    return result
+
+
+def solver_checks():
+    qp = PersistentMPC(horizon=3)
+
+    x = np.zeros(12)
+    x[5] = 0.25
+
+    feet = np.array([
+        [.18, -.13, 0],
+        [.18, .13, 0],
+        [-.18, -.13, 0],
+        [-.18, .13, 0],
+    ])
+
+    Ad, Bd, cd = build_mpc_model(
+        12.453,
+        np.diag([.14, .37, .40]),
+        feet,
+        x[3:6],
+        [0, 0, -9.81],
+    )
+
+    refs = np.tile(x, (4, 1))
+    fref = np.zeros((3, 12))
+    fref[:, 2::3] = 12.453 * 9.81 / 4
+
+    caps = np.full((3, 4), 100.0)
+    upper = np.full(12, 33.5)
+    upper[2] = 25.0
+
+    pattern = (
+        qp.A.indptr.copy(),
+        qp.A.indices.copy(),
+    )
+
+    qp.solve(
+        x, Ad, Bd, cd, refs, fref, caps,
+        np.eye(12), np.zeros(12),
+        -33.5, upper,
+    )
+
+    forces = qp.predicted_forces
+    states = qp.predicted_states
+
+    assert np.max(forces[:, 0, 2]) <= 25.0 + 2e-4
+
+    for k in range(3):
+        residual = (
+            states[k + 1]
+            - Ad @ states[k]
+            - Bd @ forces[k].ravel()
+            - cd
+        )
+        assert np.max(np.abs(residual)) < 2e-4
+
+    caps[:, 0] = 0.0
+
+    qp.solve(
+        x, Ad, Bd, cd, refs, fref, caps,
+        np.zeros((12, 12)), np.zeros(12),
+        -33.5, 33.5,
+    )
+
+    assert np.max(
+        np.abs(qp.predicted_forces[:, 0])
+    ) < 1e-3
+
+    assert np.array_equal(
+        qp.A.indptr, pattern[0]
+    )
+    assert np.array_equal(
+        qp.A.indices, pattern[1]
+    )
+
+    try:
+        qp.solve(
+            x, Ad, Bd, cd, refs, fref, caps,
+            np.zeros((12, 12)),
+            np.full(12, 1000.0),
+            -33.5, 33.5,
+        )
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError(
+            "Infeasible torque constraints were accepted"
+        )
+
+
+def stop_checks():
+    path = (
+        Path(__file__).parent
+        / "models/unitree_a1/scene_mpc.xml"
+    )
+    sim = WalkSimulation(path, cycles=1)
+
+    sim.held, sim.waited = True, 2.0
+    sim.gate_ready = lambda gate: False
+
+    try:
+        sim.advance_clock()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError(
+            "Contact timeout was ignored"
+        )
+
+    def failed_solve(*args):
+        raise RuntimeError("injected solver failure")
+
+    sim.control.solve = failed_solve
+    before = sim.data.time
+
+    try:
+        sim.step()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError(
+            "Solver failure was ignored"
+        )
+
+    assert sim.data.time == before
+
+
+def verify():
+    solver_checks()
+    stop_checks()
+    print("Solver and stop checks PASSED")
+
+    cases = [
+        ("stand", 0.0, 0.0, 1, 0.0),
+        ("forward", 0.001, 0.0, 2, 0.0),
+        ("backward", -0.001, 0.0, 1, 0.0),
+        ("left", 0.0, 0.001, 1, 0.0),
+        ("right", 0.0, -0.001, 1, 0.0),
+        ("push", 0.001, 0.0, 1, 20.0),
+    ]
+
+    passed = True
+
+    for name, vx, vy, cycles, push in cases:
+        try:
+            result = run_case(
+                vx, vy, cycles, push=push
+            )
+            passed &= result["passed"]
+
+            print(
+                name,
+                "PASSED" if result["passed"] else "FAILED",
+            )
+        except (RuntimeError, ValueError) as error:
+            passed = False
+            print(name, "FAILED:", error)
+
+    print(
+        "MPC VERIFICATION PASSED"
+        if passed
+        else "MPC VERIFICATION FAILED"
+    )
+
+    return passed
+
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--vx", type=float, default=0.001
+    )
+    parser.add_argument(
+        "--vy", type=float, default=0.0
+    )
+    parser.add_argument(
+        "--cycles", type=int, default=2
+    )
+    parser.add_argument(
+        "--headless", action="store_true"
+    )
+    parser.add_argument(
+        "--verify", action="store_true"
+    )
+
+    args = parser.parse_args()
+
+    try:
+        ok = (
+            verify()
+            if args.verify
+            else run_case(
+                args.vx,
+                args.vy,
+                args.cycles,
+                args.headless,
+            )["passed"]
+        )
+    except (RuntimeError, ValueError) as error:
+        print("MPC BASELINE FAILED:", error)
+        ok = False
+
+    raise SystemExit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()
