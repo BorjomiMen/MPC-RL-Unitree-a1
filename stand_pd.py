@@ -19,7 +19,18 @@ v_indices = model.jnt_dofadr[joint_ids]
 q_target = data.qpos[q_indices].copy()
 
 mujoco.mj_forward(model, data)
+trunk_id = model.body("trunk").id
 
+print("Масса, кг:", model.body_subtreemass[trunk_id])
+print("Центр масс, м:", data.subtree_com[trunk_id])
+
+for leg in ("FR", "FL", "RR", "RL"):
+    calf_id = model.body(f"{leg}_calf").id
+    foot_ids = np.flatnonzero(
+        (model.geom_bodyid == calf_id)
+        & (model.geom_type == mujoco.mjtGeom.mjGEOM_SPHERE)
+    )
+    print(f"Центр стопы {leg}, м:", data.geom_xpos[foot_ids[0]])
 with mujoco.viewer.launch_passive(model, data) as viewer:
     while viewer.is_running():
         start = time.perf_counter()
