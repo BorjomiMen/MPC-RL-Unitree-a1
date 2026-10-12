@@ -6,6 +6,7 @@ import mujoco.viewer
 import numpy as np
 
 from mpc_model import build_mpc_model
+from mpc_qp import StandingMPC
 
 path = Path(__file__).parent / "models/unitree_a1/scene_mpc.xml"
 model = mujoco.MjModel.from_xml_path(str(path))
@@ -76,6 +77,12 @@ x0[3:6] = com
 
 x1 = Ad @ x0 + Bd @ forces.ravel() + cd
 print("Ошибка равновесия:", np.max(np.abs(x1 - x0)))
+mpc = StandingMPC(Ad, Bd, cd, x0, forces.ravel())
+
+forces_test, status = mpc.solve(x0)
+print("Статус MPC:", status)
+print("Силы MPC, Н:")
+print(np.round(forces_test, 2))
 jacp = np.zeros((3, model.nv))
 jacr = np.zeros((3, model.nv))
 with mujoco.viewer.launch_passive(model, data) as viewer:
