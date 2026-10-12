@@ -24,13 +24,16 @@ mass = model.body_subtreemass[trunk_id]
 com = data.subtree_com[trunk_id].copy()
 
 feet = []
+foot_geom_ids = []
 for leg in ("FR", "FL", "RR", "RL"):
+    
     calf_id = model.body(f"{leg}_calf").id
     foot_ids = np.flatnonzero(
         (model.geom_bodyid == calf_id)
         & (model.geom_type == mujoco.mjtGeom.mjGEOM_SPHERE)
     )
     feet.append(data.geom_xpos[foot_ids[0]].copy())
+    foot_geom_ids.append(int(foot_ids[0]))
 
 r = np.array(feet) - com
 
@@ -43,13 +46,26 @@ assert np.all(fz >= 0), "Получены отрицательные силы о
 
 print("Силы FR, FL, RR, RL, Н:", np.round(fz, 2))
 print("Сумма сил, Н:", fz.sum())
+forces = np.zeros((4, 3))
+forces[:, 2] = fz
+
+jacp = np.zeros((3, model.nv))
+jacr = np.zeros((3, model.nv))
 with mujoco.viewer.launch_passive(model, data) as viewer:
     while viewer.is_running():
         start = time.perf_counter()
 
+        mujoco.mj_forward(model, data)
+
+        torque = data.qfrc_bias[v_indices].copy()
+
+        for geom_id, force in zip(foot_geom_ids, forces):
+            mujoco.mj_jacGeom(model, data, jacp, jacr, geom_id)
+            torque -= jacp[:, v_indices].T @ force
+
         q = data.qpos[q_indices]
         dq = data.qvel[v_indices]
-        torque = 100.0 * (q_target - q) - 3.0 * dq
+        torque += 100.0 * (q_target - q) - 3.0 * dq
 
         data.ctrl[:] = np.clip(
             torque,
