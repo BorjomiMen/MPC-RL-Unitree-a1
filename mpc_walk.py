@@ -587,4 +587,233 @@ class MPCControl:
             x, Ad, Bd, cd, refs, frefs,
             caps, T, bias, self.low, self.high,
         )
-    
+
+class WalkSimulation(StandingSimulation):
+    def __init__(
+        self, model_path,
+        vx=0.001, vy=0.0, cycles=2,
+    ):
+        super().__init__(model_path)
+
+        self.plan = GaitPlan(
+            self.data.geom_xpos[self.foot_geom_ids],
+            self.x_ref[3:6],
+            vx,
+            vy,
+            cycles,
+        )
+        self.trajectory = Trajectory(self, self.plan)
+        self.control = MPCControl(self, self.trajectory)
+
+        self.t, self.gate_index = 0.0, 0
+        self.held, self.waited = False, 0.0
+        self.dirty = True
+        self.missing_contact_time = 0.0
+        self.solve_times = []
+        self.status = "not solved"
+
+    def gate_ready(self, gate):
+        _, kind, step = gate
+
+        loads = foot_ground_loads(self)
+        feet = self.data.geom_xpos[self.foot_geom_ids]
+        support = [
+            i for i in range(4) if i != step.leg
+        ]
+
+        margin = triangle_margin(
+            self.data.subtree_com[self.trunk_id, :2],
+            feet[support, :2],
+        )
+
+        if np.min(loads[support]) < 5.0 or margin < 0.025:
+            return False
+
+        geom = self.foot_geom_ids[step.leg]
+        clearance = (
+            feet[step.leg, 2]
+            - self.model.geom_size[geom, 0]
+        )
+
+        if kind == "unload":
+            return (
+                loads[step.leg] < 10.0
+                and np.max(
+                    np.abs(self.forces[step.leg])
+                ) < 1e-3
+                and np.sum(loads[support])
+                > 0.85 * self.trajectory.weight
+                and abs(self.read_state()[11]) < 0.03
+            )
+
+        if kind == "clear":
+            return (
+                clearance > 0.025
+                and abs(loads[step.leg]) < 0.1
+            )
+
+        floor = self.model.geom("floor").id
+        body = self.model.geom_bodyid[geom]
+
+        contact = any(
+            (
+                c.geom1 == floor
+                and self.model.geom_bodyid[c.geom2] == body
+            )
+            or (
+                c.geom2 == floor
+                and self.model.geom_bodyid[c.geom1] == body
+            )
+            for c in self.data.contact[:self.data.ncon]
+        )
+
+        return (
+            contact
+            and loads[step.leg] > 0.5
+            and clearance < 0.003
+        )
+
+    def advance_clock(self):
+        dt = self.model.opt.timestep
+
+        if self.gate_index < len(self.plan.gates):
+            gate = self.plan.gates[self.gate_index]
+
+            if (
+                self.held
+                or self.t + dt >= gate[0] - 1e-10
+            ):
+                self.t = gate[0]
+                arriving = not self.held
+                self.held = not self.gate_ready(gate)
+                self.dirty = (
+                    self.dirty
+                    or arriving
+                    or not self.held
+                )
+
+                if self.held:
+                    self.waited += dt
+
+                    if self.waited > 2.0:
+                        raise RuntimeError(
+                            f"Contact gate timeout: "
+                            f"{gate[1]} "
+                            f"{LEG_NAMES[gate[2].leg]}"
+                        )
+                else:
+                    self.gate_index += 1
+                    self.waited = 0.0
+
+                return
+
+        self.t = min(
+            self.t + dt, self.plan.duration
+        )
+
+    def step(self):
+        model, data = self.model, self.data
+        mujoco.mj_forward(model, data)
+
+        self.applied_t = self.t
+
+        gate = (
+            self.plan.gates[self.gate_index][0]
+            if self.gate_index < len(self.plan.gates)
+            else np.inf
+        )
+
+        if (
+            self.step_count % self.steps_per_mpc == 0
+            or self.dirty
+        ):
+            started = time.perf_counter()
+
+            try:
+                self.forces = self.control.solve(
+                    self.t, gate, self.held
+                )
+            except RuntimeError as error:
+                raise RuntimeError(
+                    f"STOP at {self.t:.3f}s: {error}"
+                ) from error
+
+            self.solve_times.append(
+                1000.0 * (
+                    time.perf_counter() - started
+                )
+            )
+
+            self.status = "solved"
+            self.mpc_updates += 1
+            self.dirty = False
+
+        q, dq = self.trajectory.posture(
+            self.t, self.held
+        )
+        T, bias = self.control.torque_map(q, dq)
+        torque = T @ self.forces.ravel() + bias
+
+        limits = model.actuator_ctrlrange
+
+        if (
+            not np.isfinite(torque).all()
+            or np.any(torque < limits[:, 0] - 1e-6)
+            or np.any(torque > limits[:, 1] + 1e-6)
+        ):
+            raise RuntimeError(
+                "STOP: applied torque would exceed actuator limits"
+            )
+
+        self.unclipped_torque = torque.copy()
+        data.ctrl[:] = np.clip(
+            torque, limits[:, 0], limits[:, 1]
+        )
+
+        mujoco.mj_step(model, data)
+        self.step_count += 1
+        mujoco.mj_forward(model, data)
+
+        state = self.read_state()
+
+        if (
+            not np.isfinite(data.qpos).all()
+            or not np.isfinite(state).all()
+            or data.qpos[2] < 0.15
+            or np.max(np.abs(state[:2]))
+            > np.radians(10.0)
+        ):
+            raise RuntimeError(
+                "STOP: unstable or non-finite robot state"
+            )
+
+        if self.t > 3.0:
+            _, _, _, active, _ = self.plan.sample(self.t)
+            required = np.ones(4, dtype=bool)
+
+            if (
+                active is not None
+                and active.unload_start
+                <= self.t < active.reload_end
+            ):
+                required[active.leg] = False
+
+            missing = (
+                np.min(
+                    foot_ground_loads(self)[required]
+                ) < 0.5
+            )
+
+            self.missing_contact_time = (
+                self.missing_contact_time
+                + model.opt.timestep
+                if missing
+                else 0.0
+            )
+
+            if self.missing_contact_time > 0.1:
+                raise RuntimeError(
+                    "STOP: lost a required stance contact"
+                )
+
+        self.advance_clock()
