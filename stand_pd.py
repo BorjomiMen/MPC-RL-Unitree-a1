@@ -5,6 +5,8 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 
+from mpc_model import build_mpc_model
+
 path = Path(__file__).parent / "models/unitree_a1/scene_mpc.xml"
 model = mujoco.MjModel.from_xml_path(str(path))
 model.opt.timestep = 0.001
@@ -22,7 +24,21 @@ mujoco.mj_forward(model, data)
 trunk_id = model.body("trunk").id
 mass = model.body_subtreemass[trunk_id]
 com = data.subtree_com[trunk_id].copy()
+inertia = np.zeros((3, 3))
 
+for body_id in np.flatnonzero(model.body_rootid == trunk_id):
+    rotation = data.ximat[body_id].reshape(3, 3)
+    offset = data.xipos[body_id] - com
+
+    inertia += (
+        rotation
+        @ np.diag(model.body_inertia[body_id])
+        @ rotation.T
+    )
+    inertia += model.body_mass[body_id] * (
+        np.dot(offset, offset) * np.eye(3)
+        - np.outer(offset, offset)
+    )
 feet = []
 foot_geom_ids = []
 for leg in ("FR", "FL", "RR", "RL"):
@@ -48,7 +64,18 @@ print("Силы FR, FL, RR, RL, Н:", np.round(fz, 2))
 print("Сумма сил, Н:", fz.sum())
 forces = np.zeros((4, 3))
 forces[:, 2] = fz
+contacts = np.array(feet)
+contacts[:, 2] -= model.geom_size[foot_geom_ids, 0]
 
+Ad, Bd, cd = build_mpc_model(
+    mass, inertia, contacts, com, model.opt.gravity
+)
+
+x0 = np.zeros(12)
+x0[3:6] = com
+
+x1 = Ad @ x0 + Bd @ forces.ravel() + cd
+print("Ошибка равновесия:", np.max(np.abs(x1 - x0)))
 jacp = np.zeros((3, model.nv))
 jacr = np.zeros((3, model.nv))
 with mujoco.viewer.launch_passive(model, data) as viewer:
