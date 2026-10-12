@@ -408,3 +408,183 @@ class PersistentMPC:
             raise ValueError("Non-finite QP input")
 
         return result
+    
+    def solve(
+        self, x, Ad, Bd, cd, refs, frefs,
+        caps, T, bias, tau_min, tau_max,
+    ):
+        started = time.perf_counter()
+        N = self.N
+
+        x = self.array(x, (12,))
+        Ad, Bd = (
+            self.array(a, (N, 12, 12))
+            for a in (Ad, Bd)
+        )
+        cd = self.array(cd, (N, 12))
+        refs = self.array(refs, (N + 1, 12))
+        frefs = self.array(frefs, (N, 12))
+        caps = self.array(caps, (N, 4))
+        T = self.array(T, (N, 12, 12))
+        bias = self.array(bias, (N, 12))
+        tau_min, tau_max = (
+            self.array(a, (N, 12))
+            for a in (tau_min, tau_max)
+        )
+
+        if np.any(caps < 0) or np.any(tau_min >= tau_max):
+            raise ValueError("Invalid QP bounds")
+
+        self.A.data[self.ad_slots] = -Ad.reshape(N, 144)
+        self.A.data[self.bd_slots] = -Bd.reshape(N, 144)
+        self.A.data[self.torque_slots] = T.reshape(N, 144)
+
+        bounds = np.r_[x, cd.ravel()]
+        self.lower[:self.offset] = bounds
+        self.upper[:self.offset] = bounds
+
+        self.upper[self.fz_rows] = caps.ravel()
+        self.lower[self.force_end:] = (
+            tau_min - bias
+        ).ravel()
+        self.upper[self.force_end:] = (
+            tau_max - bias
+        ).ravel()
+
+        q = np.r_[
+            (-2.0 * self.weights * refs).ravel(),
+            (-2.0 * self.R * frefs).ravel(),
+        ]
+
+        self.solver.update(
+            Ax=self.A.data,
+            q=q,
+            l=self.lower,
+            u=self.upper,
+        )
+        result = self.solver.solve(raise_error=False)
+
+        self.last_info = result.info
+        self.wall_ms = 1000.0 * (
+            time.perf_counter() - started
+        )
+
+        if (
+            result.info.status != "solved"
+            or result.x is None
+            or not np.isfinite(result.x).all()
+        ):
+            raise RuntimeError(
+                f"QP failed: {result.info.status}"
+            )
+
+        az = self.A @ result.x
+        self.last_violation = max(
+            0.0,
+            float(np.max(self.lower - az)),
+            float(np.max(az - self.upper)),
+        )
+
+        if self.last_violation > 2e-4:
+            raise RuntimeError(
+                f"QP constraint violation: "
+                f"{self.last_violation:.3g}"
+            )
+
+        self.predicted_states = result.x[
+            :self.offset
+        ].reshape(N + 1, 12).copy()
+
+        self.predicted_forces = result.x[
+            self.offset:
+        ].reshape(N, 4, 3).copy()
+
+        return self.predicted_forces[0].copy()
+
+
+class MPCControl:
+    def __init__(self, sim, trajectory):
+        self.sim, self.trajectory = sim, trajectory
+        self.qp = PersistentMPC()
+        self.dt = 0.02
+
+        self.low = sim.model.actuator_ctrlrange[:, 0] + 2.0
+        self.high = sim.model.actuator_ctrlrange[:, 1] - 2.0
+
+        trajectory.weight = (
+            -sim.model.body_subtreemass[sim.trunk_id]
+            * sim.model.opt.gravity[2]
+        )
+
+    def torque_map(self, q, dq):
+        sim = self.sim
+        model, data = sim.model, sim.data
+        T = np.zeros((12, 12))
+
+        for foot, geom in enumerate(sim.foot_geom_ids):
+            point = data.geom_xpos[geom].copy()
+            point[2] -= model.geom_size[geom, 0]
+
+            mujoco.mj_jac(
+                model,
+                data,
+                sim.jacp,
+                sim.jacr,
+                point,
+                int(model.geom_bodyid[geom]),
+            )
+
+            T[:, 3 * foot:3 * foot + 3] = (
+                -sim.jacp[:, sim.v_indices].T
+            )
+
+        bias = (
+            data.qfrc_bias[sim.v_indices]
+            + 100.0 * (
+                q - data.qpos[sim.q_indices]
+            )
+            + 3.0 * (
+                dq - data.qvel[sim.v_indices]
+            )
+        )
+
+        return T, bias
+
+    def solve(self, t, gate=np.inf, frozen=False):
+        sim = self.sim
+        model, data = sim.model, sim.data
+
+        x = sim.read_state()
+        q, dq = self.trajectory.posture(t, frozen)
+        T, bias = self.torque_map(q, dq)
+
+        com = data.subtree_com[sim.trunk_id].copy()
+        contacts = data.geom_xpos[
+            sim.foot_geom_ids
+        ].copy()
+        contacts[:, 2] -= model.geom_size[
+            sim.foot_geom_ids, 0
+        ]
+
+        inertia = robot_inertia(
+            model, data, sim.trunk_id, com
+        )
+
+        Ad, Bd, cd = build_mpc_model(
+            model.body_subtreemass[sim.trunk_id],
+            inertia,
+            contacts,
+            com,
+            model.opt.gravity,
+            dt=self.dt,
+        )
+
+        refs, frefs, caps = self.trajectory.preview(
+            t, self.qp.N, self.dt, gate, frozen
+        )
+
+        return self.qp.solve(
+            x, Ad, Bd, cd, refs, frefs,
+            caps, T, bias, self.low, self.high,
+        )
+    
