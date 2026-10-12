@@ -262,3 +262,149 @@ class Trajectory:
             forces.append(force.ravel())
 
         return refs, np.array(forces), caps
+class PersistentMPC:
+    def __init__(self, horizon=15, mu=0.5):
+        self.N = int(horizon)
+        self.offset = 12 * (self.N + 1)
+        self.force_end = self.offset + 20 * self.N
+        self.rows = self.force_end + 12 * self.N
+        self.cols = self.offset + 12 * self.N
+
+        self.weights = np.tile(
+            [120, 120, 30, 20, 20, 250, 2, 2, 1, 5, 5, 15],
+            (self.N + 1, 1),
+        ).astype(float)
+        self.weights[-1] *= 5.0
+        self.R = 0.001
+
+        rows, cols, values = [], [], []
+
+        def block(row, col, value):
+            rr, cc = np.indices(value.shape)
+            slots = np.arange(
+                len(values), len(values) + value.size
+            )
+
+            rows.extend((row + rr).ravel())
+            cols.extend((col + cc).ravel())
+            values.extend(value.ravel())
+
+            return slots
+
+        rows.extend(range(self.offset))
+        cols.extend(range(self.offset))
+        values.extend(np.ones(self.offset))
+
+        ad, bd, td = [], [], []
+
+        for k in range(self.N):
+            ad.append(block(
+                12 * (k + 1),
+                12 * k,
+                np.zeros((12, 12)),
+            ))
+            bd.append(block(
+                12 * (k + 1),
+                self.offset + 12 * k,
+                np.zeros((12, 12)),
+            ))
+            td.append(block(
+                self.force_end + 12 * k,
+                self.offset + 12 * k,
+                np.zeros((12, 12)),
+            ))
+
+        a = mu / np.sqrt(2.0)
+        cone = np.array([
+            [1, 0, -a],
+            [-1, 0, -a],
+            [0, 1, -a],
+            [0, -1, -a],
+            [0, 0, 1.0],
+        ])
+
+        for k in range(self.N):
+            for foot in range(4):
+                block(
+                    self.offset + 20 * k + 5 * foot,
+                    self.offset + 12 * k + 3 * foot,
+                    cone,
+                )
+
+        rows, cols = np.array(rows), np.array(cols)
+        order = np.lexsort((rows, cols))
+        inverse = np.empty_like(order)
+        inverse[order] = np.arange(len(order))
+
+        self.ad_slots, self.bd_slots, self.torque_slots = (
+            inverse[np.array(slots)]
+            for slots in (ad, bd, td)
+        )
+
+        indptr = np.r_[
+            0,
+            np.cumsum(
+                np.bincount(cols, minlength=self.cols)
+            ),
+        ]
+
+        self.A = sparse.csc_matrix(
+            (
+                np.array(values)[order],
+                rows[order],
+                indptr,
+            ),
+            shape=(self.rows, self.cols),
+        )
+
+        self.lower = np.full(self.rows, -np.inf)
+        self.upper = np.zeros(self.rows)
+
+        self.lower[:self.offset] = 0.0
+
+        self.fz_rows = np.arange(
+            self.offset + 4, self.force_end, 5
+        )
+        self.lower[self.fz_rows] = 0.0
+        self.upper[self.fz_rows] = 100.0
+
+        self.lower[self.force_end:] = -33.5
+        self.upper[self.force_end:] = 33.5
+
+        P = sparse.diags(
+            np.r_[
+                2.0 * self.weights.ravel(),
+                np.full(12 * self.N, 2.0 * self.R),
+            ],
+            format="csc",
+        )
+
+        self.solver = osqp.OSQP()
+        self.solver.setup(
+            P=P,
+            q=np.zeros(self.cols),
+            A=self.A,
+            l=self.lower,
+            u=self.upper,
+            verbose=False,
+            warm_starting=True,
+            polishing=True,
+            eps_abs=1e-6,
+            eps_rel=1e-6,
+            max_iter=10000,
+        )
+
+        self.last_info = None
+        self.last_violation = 0.0
+        self.wall_ms = 0.0
+
+    @staticmethod
+    def array(value, shape):
+        result = np.broadcast_to(
+            np.asarray(value, dtype=float), shape
+        )
+
+        if not np.isfinite(result).all():
+            raise ValueError("Non-finite QP input")
+
+        return result
