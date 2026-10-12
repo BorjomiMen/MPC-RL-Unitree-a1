@@ -166,3 +166,99 @@ class GaitPlan:
                 break
 
         return caps
+class Trajectory:
+    def __init__(self, sim, plan, dt=0.02):
+        self.plan = plan
+        self.times = np.linspace(
+            0.0,
+            plan.duration,
+            round(plan.duration / dt) + 1,
+        )
+
+        ik = WholeBodyIK(sim, sim.data.qpos)
+
+        self.joints = np.array([
+            ik.solve(
+                plan.sample(t)[0],
+                plan.sample(t)[1],
+            )[sim.q_indices]
+            for t in self.times
+        ])
+
+        self.rates = np.gradient(self.joints, dt, axis=0)
+        self.ik_error = ik.max_error
+
+    def posture(self, t, frozen=False):
+        fraction = np.clip(t / self.plan.duration, 0.0, 1.0)
+        q = interpolate(self.joints, fraction)
+
+        dq = (
+            np.zeros(12)
+            if frozen
+            else interpolate(self.rates, fraction)
+        )
+
+        return q, dq
+
+    def reference(self, t, frozen=False):
+        _, com, velocity, _, _ = self.plan.sample(t)
+
+        x = np.zeros(12)
+        x[3:6] = com
+
+        if not frozen:
+            x[9:12] = velocity
+
+        return x
+
+    def preview(self, t, N, dt, gate=np.inf, frozen=False):
+        times = (
+            np.full(N + 1, t)
+            if frozen
+            else np.minimum(
+                t + dt * np.arange(N + 1), gate
+            )
+        )
+
+        refs = np.array([
+            self.reference(s, frozen) for s in times
+        ])
+        caps = np.array([
+            self.plan.limits(s) for s in times[:-1]
+        ])
+
+        forces = []
+
+        for seconds in times[:-1]:
+            feet, com, _, step, _ = self.plan.sample(seconds)
+            r = feet - com
+
+            balance = np.vstack((
+                np.ones(4),
+                r[:, 1],
+                -r[:, 0],
+            ))
+            target = np.array([self.weight, 0.0, 0.0])
+
+            fz = np.linalg.lstsq(
+                balance, target, rcond=None
+            )[0]
+
+            if step is not None:
+                leg = step.leg
+                support = [i for i in range(4) if i != leg]
+
+                fz[leg] *= self.plan.availability(step, seconds)
+                fz[support] = np.linalg.solve(
+                    balance[:, support],
+                    target - balance[:, leg] * fz[leg],
+                )
+
+            if np.min(fz) < -1e-5:
+                raise RuntimeError("Invalid static force reference")
+
+            force = np.zeros((4, 3))
+            force[:, 2] = np.maximum(fz, 0.0)
+            forces.append(force.ravel())
+
+        return refs, np.array(forces), caps
